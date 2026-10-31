@@ -1,4 +1,6 @@
 import http from 'node:http';
+import {analyzePlant} from './vision.mjs';
+import {catalog,searchPlants} from './catalog.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -10,7 +12,7 @@ const str=(v,name,max=200)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fai
 const pick=(v,values,name)=>{if(!values.includes(v))fail(400,`Invalid ${name}.`);return v};
 const now=()=>new Date().toISOString();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,demo:!!u.demo});
-export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(',')}={}){
+export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants}={}){
  if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true});
  const db=new DatabaseSync(dbPath); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
  db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,demo INTEGER,created TEXT);
@@ -28,10 +30,21 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
   plants.forEach(p=>{save('plant',u.id,p);save('journal',u.id,{id:randomUUID(),plantId:p.id,type:'Milestone',note:`Added ${p.name} to my garden.`,created:date});});
   plants.slice(0,2).forEach(p=>save('task',u.id,{id:randomUUID(),plantId:p.id,title:`Check soil for ${p.name}`,due:date,done:false}));
   save('provider',u.id,{id:'local-growers-'+u.id,name:'Root & Rise Nursery',area:'St. Louis, MO',status:'approved',pickup:'Sample pickup location — arrange after ordering',created:date});
-  [{name:'Genovese basil',species:'Ocimum basilicum',type:'Seedlings',price:600,stock:24,image:'basil',description:'A fragrant kitchen companion. A pack of four young basil plants.'},{name:'Monstera cutting',species:'Monstera deliciosa',type:'Seedlings',price:1200,stock:8,image:'monstera',description:'A rooted cutting, ready for its next growing chapter.'},{name:'Cherry tomato seeds',species:'Solanum lycopersicum',type:'Seeds',price:450,stock:40,image:'sprout',description:'A packet of twenty seeds for your next sunny-season garden.'}].forEach(p=>save('listing',u.id,{...p,id:randomUUID(),providerId:'local-growers-'+u.id,provider:'Root & Rise Nursery',area:'St. Louis, MO',active:true}));
+  seedCatalog(u);
   save('provider',u.id,{id:randomUUID(),name:'Seed & Stem Collective',area:'St. Louis, MO',status:'pending',created:date});
  }
+ function seedCatalog(u){
+  if(list('catalog_version',u.id).some(v=>v.version===2))return;
+  const providerId='local-growers-'+u.id;
+  if(!list('provider',u.id).some(p=>p.id===providerId))save('provider',u.id,{id:providerId,name:'Root & Rise Nursery (sample)',area:'St. Louis, MO',status:'approved',sample:true});
+  const current=list('listing',u.id);
+  for(const item of catalog){const old=current.find(p=>p.sku===item.sku)||current.find(p=>!p.sku&&['Genovese basil','Cherry tomato seeds','Monstera cutting'].includes(p.name)&&p.species===item.species&&p.type===item.type);save('listing',u.id,{...item,id:old?.id||randomUUID(),providerId,provider:'Root & Rise Nursery (sample)',area:'St. Louis, MO',active:old?old.active:true,stock:old?old.stock:item.stock});}
+  save('catalog_version',u.id,{id:'catalog-version-'+u.id,version:2});
+ }
+ let activeAnalyses=0;
+ const referenceCache=new Map();
  function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:publicUser(u)}}
+ for(const record of db.prepare("SELECT * FROM records WHERE kind='assessment'").all()){const a=JSON.parse(record.body);if(['queued','running'].includes(a.status))save('assessment',record.owner,{...a,status:'failed',error:'The server restarted during analysis. Your photo is saved; please retry.'})}
  const rate=new Map();
  const server=http.createServer(async(req,res)=>{
   const origin=req.headers.origin;
@@ -54,7 +67,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    const requireRole=(...roles)=>{if(!roles.includes(u.role))fail(403,'Your account does not have permission for this action.')};
    if(path==='/api/v1/auth/logout'&&method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(token);return send(200,{ok:true})}
    if(path==='/api/v1/me'&&method==='GET')return send(200,publicUser(u));
-   if(path==='/api/v1/bootstrap'&&method==='GET')return send(200,{user:publicUser(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:'simulated',payments:'simulated',email:'not-configured'}});
+   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:publicUser(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'sample',payments:'simulated',email:'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
    if(resource==='plants'){
     if(method==='GET')return send(200,id?get('plant',id,u.id):list('plant',u.id));
@@ -77,13 +90,30 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    }
    if(resource==='assessments'){
     if(method==='GET')return send(200,get('assessment',id,u.id));
-    if(method==='POST'){const plant=get('plant',body.plantId,u.id);if(body.mediaId)get('media',body.mediaId,u.id);const a={id:randomUUID(),plantId:plant.id,status:'completed',simulated:true,mediaId:body.mediaId||null,observations:str(body.symptoms,'Observed symptoms',1200),context:{watering:body.watering||'Unknown',light:body.light||'Unknown'},uncertainty:'Illustrative result — image not analyzed',causes:[{name:'Possible watering stress',evidence:'Sample explanation only. This result is not based on an analysis of your photograph.'},{name:'Possible light stress',evidence:'More growing context and a real assessment service are needed.'}],actions:['Check soil moisture before changing watering.','Record light conditions and recent care changes.','Compare new observations at your next check.'],created:now()};save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:'Saved a simulated plant assessment.',created:a.created});return send(201,a)}
+    if(method==='POST'){
+     const plant=get('plant',body.plantId,u.id);
+     if(body.consent!==true)fail(400,'Confirm that your photo and growing context can be sent to OpenAI for analysis.');
+     if(!body.mediaId)fail(400,'Add a plant photograph before requesting analysis.');
+     const media=get('media',body.mediaId,u.id),symptoms=str(body.symptoms||'Assess the visible plant condition.','Observed symptoms',1200);
+     if(analyzer===analyzePlant&&!process.env.OPENAI_API_KEY)fail(503,'Image analysis is not configured. Please try again later.');
+     const key=str(req.headers['idempotency-key'],'Assessment request key',100),previous=db.prepare('SELECT response FROM requests WHERE owner=? AND key=?').get(u.id,'assessment:'+key);
+     if(previous)return send(200,get('assessment',JSON.parse(previous.response).id,u.id));
+     const day=now().slice(0,10),daily=db.prepare("SELECT COUNT(*) AS n FROM records WHERE kind='assessment' AND json_extract(body,'$.created')>=?").get(day).n;
+     if(daily>=Number(process.env.ANALYSIS_DAILY_LIMIT||100)||list('assessment',u.id).filter(a=>a.created.startsWith(day)).length>=10)fail(429,'The daily photo analysis limit has been reached. Please try again tomorrow.');
+     if(activeAnalyses>=2)fail(429,'The plant doctor is busy. Please retry shortly.');
+     if(list('assessment',u.id).some(a=>['queued','running'].includes(a.status)))fail(409,'A plant assessment is already running for your garden.');
+     const a={id:randomUUID(),plantId:plant.id,status:'queued',simulated:false,provider:'OpenAI',mediaId:body.mediaId,observations:symptoms,userObservations:symptoms,context:{watering:typeof body.watering==='string'?body.watering.slice(0,800):'Unknown',light:typeof body.light==='string'?body.light.slice(0,800):'Unknown'},created:now(),consentAt:now()};
+     save('assessment',u.id,a);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,'assessment:'+key,JSON.stringify({id:a.id}));activeAnalyses++;
+     setImmediate(async()=>{try{a.status='running';save('assessment',u.id,a);const result=await analyzer({image:media.data,plant,symptoms,watering:a.context.watering,light:a.context.light});Object.assign(a,result,{status:result.imageQuality==='usable'?'completed':'inconclusive',completed:now()});save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:`Photo assessment: ${a.observations}`,assessmentId:a.id,mediaId:body.mediaId,created:now()});}catch(e){a.status='failed';a.error=e.message||'Image analysis could not complete.';save('assessment',u.id,a);}finally{activeAnalyses--;}});
+     return send(202,{id:a.id,plantId:a.plantId,status:a.status,simulated:false,provider:'OpenAI'});
+    }
    }
    if(resource==='stories'){
     if(method==='POST'){const p=get('plant',body.plantId,u.id),entries=list('journal',u.id).filter(e=>e.plantId===p.id);const text=entries.map(e=>`${new Date(e.created).toLocaleDateString('en-US',{timeZone:'UTC'})}: ${e.note}`).join('\n');return send(201,save('story',u.id,{id:randomUUID(),plantId:p.id,title:`${p.name}'s growing story`,text:text||'Your growing story starts with your first journal entry.',privacy:'private',generated:true,created:now()}))}
     if(method==='PATCH'){const s=get('story',id,u.id);s.text=str(body.text,'Story',10000);return send(200,save('story',u.id,s))}
    }
-   if(resource==='listings'){
+   if(resource==='plant-search'&&method==='GET'){const q=str(url.searchParams.get('q'),'Plant search',100),cached=referenceCache.get(q.toLowerCase());if(cached&&Date.now()-cached.at<86400000)return send(200,{results:cached.results,source:'GBIF',cached:true});try{const results=await plantSearch(q);if(referenceCache.size>250)referenceCache.clear();referenceCache.set(q.toLowerCase(),{at:Date.now(),results});return send(200,{results,source:'GBIF',cached:false})}catch{fail(502,'Plant reference lookup is temporarily unavailable. Please retry.')}}
+   if(resource==='listings'){seedCatalog(u);
     if(method==='GET')return send(200,list('listing',u.id).filter(p=>p.active));
     requireRole('provider','admin');
     if(method==='POST'||method==='PATCH'){const providers=list('provider',u.id).filter(p=>p.status==='approved');if(!providers.length)fail(403,'An approved provider is required.');const p=method==='PATCH'?get('listing',id,u.id):{id:randomUUID(),providerId:providers[0].id,provider:providers[0].name,area:providers[0].area,active:true};for(const k of ['name','species','description'])p[k]=str(body[k]??p[k],k,1000);p.type=pick(body.type??p.type,['Seeds','Seedlings'],'product type');for(const k of ['price','stock']){const v=body[k]??p[k];if(!Number.isInteger(v)||v<0||v>10000000)fail(400,`Invalid ${k}.`);p[k]=v}p.image=body.image||p.image||'sprout';audit(u,'Saved listing',p.name);return send(method==='POST'?201:200,save('listing',u.id,p))}
