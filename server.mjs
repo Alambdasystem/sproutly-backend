@@ -1,6 +1,7 @@
 import http from 'node:http';
 import {analyzePlant} from './vision.mjs';
 import {catalog,searchPlants} from './catalog.mjs';
+import {searchMarketplace} from './marketplace.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
@@ -12,7 +13,7 @@ const str=(v,name,max=200)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fai
 const pick=(v,values,name)=>{if(!values.includes(v))fail(400,`Invalid ${name}.`);return v};
 const now=()=>new Date().toISOString();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,demo:!!u.demo});
-export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants}={}){
+export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants,marketplaceSearch=searchMarketplace}={}){
  if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true});
  const db=new DatabaseSync(dbPath); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
  db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,demo INTEGER,created TEXT);
@@ -43,6 +44,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  }
  let activeAnalyses=0;
  const referenceCache=new Map();
+ const merchantCache=new Map();const merchantPending=new Map();
  function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:publicUser(u)}}
  for(const record of db.prepare("SELECT * FROM records WHERE kind='assessment'").all()){const a=JSON.parse(record.body);if(['queued','running'].includes(a.status))save('assessment',record.owner,{...a,status:'failed',error:'The server restarted during analysis. Your photo is saved; please retry.'})}
  const rate=new Map();
@@ -67,7 +69,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    const requireRole=(...roles)=>{if(!roles.includes(u.role))fail(403,'Your account does not have permission for this action.')};
    if(path==='/api/v1/auth/logout'&&method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(token);return send(200,{ok:true})}
    if(path==='/api/v1/me'&&method==='GET')return send(200,publicUser(u));
-   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:publicUser(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'sample',payments:'simulated',email:'not-configured'}});}
+   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:publicUser(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'strictly-medicinal-public-catalog',sampleCatalog:true,payments:'simulated',email:'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
    if(resource==='plants'){
     if(method==='GET')return send(200,id?get('plant',id,u.id):list('plant',u.id));
@@ -113,6 +115,13 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     if(method==='PATCH'){const s=get('story',id,u.id);s.text=str(body.text,'Story',10000);return send(200,save('story',u.id,s))}
    }
    if(resource==='plant-search'&&method==='GET'){const q=str(url.searchParams.get('q'),'Plant search',100),cached=referenceCache.get(q.toLowerCase());if(cached&&Date.now()-cached.at<86400000)return send(200,{results:cached.results,source:'GBIF',cached:true});try{const results=await plantSearch(q);if(referenceCache.size>250)referenceCache.clear();referenceCache.set(q.toLowerCase(),{at:Date.now(),results});return send(200,{results,source:'GBIF',cached:false})}catch{fail(502,'Plant reference lookup is temporarily unavailable. Please retry.')}}
+   if(path==='/api/v1/marketplace/search'&&method==='GET'){
+    const q=str(url.searchParams.get('q')||'basil','Product search',100);if(q.length<2)fail(400,'Enter at least two characters.');
+    const pageText=url.searchParams.get('page')||'1';if(!/^[1-5]$/.test(pageText))fail(400,'Page must be between 1 and 5.');const page=Number(pageText),cacheKey=q.toLowerCase()+':'+page;
+    const cached=merchantCache.get(cacheKey);if(cached&&Date.now()-cached.at<900000)return send(200,{...cached.data,cached:true});
+    if(!merchantPending.has(cacheKey)&&merchantPending.size>=3)fail(429,'The shop search is busy. Please retry shortly.');
+    try{if(!merchantPending.has(cacheKey))merchantPending.set(cacheKey,marketplaceSearch(q,{page}).then(data=>{if(merchantCache.size>=100)merchantCache.clear();merchantCache.set(cacheKey,{data,at:Date.now()});return data}).finally(()=>merchantPending.delete(cacheKey)));const data=await merchantPending.get(cacheKey);return send(200,{...data,cached:false})}catch{fail(502,'The merchant catalog is temporarily unavailable. No sample results were substituted. Please retry later.')}
+   }
    if(resource==='listings'){seedCatalog(u);
     if(method==='GET')return send(200,list('listing',u.id).filter(p=>p.active));
     requireRole('provider','admin');
