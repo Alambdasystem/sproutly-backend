@@ -1,7 +1,7 @@
 import {randomUUID} from 'node:crypto';
 const reject=(status,message)=>{throw Object.assign(new Error(message),{status})};
 const types={
- 'seed-packets':{fields:['name','variety','brand','mediaIds','instructions','sources'],required:['name']},
+ 'seed-packets':{fields:['name','variety','brand','mediaIds','instructions','sources','extractionId'],required:['name']},
  'seed-projects':{fields:['name','packetId','plantId','growingMethod','sowingDate','stage','sources'],required:['name']},
  conversations:{fields:['title','plantId','projectId'],required:['title']},
  'grow-plans':{fields:['title','projectId','instructions','sources'],required:['title','projectId']},
@@ -29,6 +29,7 @@ export function createFoundation(db,{ownedRecord}={}){
    }else out[key]=text(value,key,['instructions','objective'].includes(key)?10000:200);
   }
   for(const key of spec.required)if(!out[key])reject(400,`${key} is required.`);
+  if(out.extractionId){const extraction=ownedRecord('packet_extraction',out.extractionId,owner);if(extraction.status!=='confirmed')reject(409,'Confirm the extracted packet fields before saving.');out.confirmedFields=extraction.confirmedFields;out.extractedFields=extraction.fields;out.confirmedAt=extraction.confirmedAt;out.originalMediaIds=extraction.photos.map(p=>p.originalMediaId);}
   if(out.plantId)ownedRecord('plant',out.plantId,owner);
   if(out.packetId)read(owner,'seed-packets',out.packetId);
   if(out.projectId)read(owner,'seed-projects',out.projectId);
@@ -44,7 +45,7 @@ export function createFoundation(db,{ownedRecord}={}){
    const previous=id?read(owner,kind,id):null;
    if(previous&&expectedRevision!==previous.revision)reject(409,'The record changed. Reload before saving.');
    // Links are immutable after creation; moving a conversation or plan would mix histories.
-   if(previous)for(const key of ['plantId','projectId','packetId'])if(input[key]!==undefined&&input[key]!==previous[key])reject(400,'Record links cannot be changed.');
+   if(previous)for(const key of ['plantId','projectId','packetId','extractionId'])if(input[key]!==undefined&&input[key]!==previous[key])reject(400,'Record links cannot be changed.');
    const fields=validate(owner,kind,{...(previous?Object.fromEntries(types[kind].fields.filter(k=>previous[k]!==undefined).map(k=>[k,previous[k]])):{}),...input});
    const stamp=new Date().toISOString(),record={...fields,id:id||randomUUID(),schemaVersion:1,revision:(previous?.revision||0)+1,created:previous?.created||stamp,updated:stamp};
    db.prepare('INSERT INTO foundation_records VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body').run(record.id,owner,kind,record.revision,JSON.stringify(record));
