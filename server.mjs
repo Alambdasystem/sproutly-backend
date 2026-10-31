@@ -75,6 +75,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  for(const record of db.prepare("SELECT * FROM records WHERE kind='packet_extraction'").all()){const job=JSON.parse(record.body);if(['queued','running'].includes(job.status))save('packet_extraction',record.owner,{...job,status:'failed',error:'The server restarted during this scan. Your photos are saved; retry the scan.'})}
  const rate=new Map();
  const server=http.createServer(async(req,res)=>{
+  const requestId=randomUUID(),started=performance.now();res.setHeader('X-Request-ID',requestId);res.once('finish',()=>{if(process.env.REQUEST_METRICS==='true')console.log(JSON.stringify({event:'api_request',requestId,method:req.method,status:res.statusCode,durationMs:Math.round(performance.now()-started)}))});
   const origin=req.headers.origin;
   if(origin&&origins.includes(origin)){res.setHeader('Access-Control-Allow-Origin',origin);res.setHeader('Vary','Origin')}
   res.setHeader('Access-Control-Allow-Headers','Authorization,Content-Type,Idempotency-Key');res.setHeader('Access-Control-Allow-Methods','GET,POST,PATCH,DELETE,OPTIONS');res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Cache-Control','no-store');
@@ -119,7 +120,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    if(path==='/api/v1/packet-media/prepare'&&method==='POST'){
     if(activePhotoEdits||activePacketExtractions||activeAnalyses||activeAudio||care.isBusy())fail(429,'Photo processing is busy. Please retry shortly.');
     const media=get('media',str(body.mediaId,'Photo id',100),u.id);activePhotoEdits++;
-    try{const result=await preparePacketImage(media.data,{rotation:body.rotation??0,crop:body.crop});const edited=save('media',u.id,{id:randomUUID(),data:result.data,originalMediaId:media.originalMediaId||media.id,created:now()});return send(201,{...result,id:edited.id,originalMediaId:edited.originalMediaId})}finally{activePhotoEdits--}
+    try{const result=await preparePacketImage(media.data,{rotation:body.rotation??0,crop:body.crop});if(!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))fail(401,'This account was removed.');const edited=save('media',u.id,{id:randomUUID(),data:result.data,originalMediaId:media.originalMediaId||media.id,created:now()});return send(201,{...result,id:edited.id,originalMediaId:edited.originalMediaId})}finally{activePhotoEdits--}
    }
    if(parts[0]==='api'&&parts[1]==='v1'&&resource==='packet-extractions'){
     if(method==='GET'&&id&&parts.length===4)return send(200,get('packet_extraction',id,u.id));
@@ -135,7 +136,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
      const day=now().slice(0,10),daily=db.prepare("SELECT COUNT(*) AS n FROM records WHERE kind='packet_extraction' AND json_extract(body,'$.created')>=?").get(day).n;
      if(daily>=Number(process.env.PACKET_DAILY_LIMIT||50)||list('packet_extraction',u.id).filter(j=>j.created.startsWith(day)).length>=5)fail(429,'The daily packet scan limit has been reached. Use manual entry or try tomorrow.');
      const job={id:randomUUID(),photos,status:'queued',created:now(),consentAt:now(),provider:'OpenAI',schemaVersion:1};save('packet_extraction',u.id,job);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,key,JSON.stringify({id:job.id}));activePacketExtractions++;
-     setImmediate(async()=>{try{job.status='running';save('packet_extraction',u.id,job);const result=await packetExtractor({photos:photos.map(p=>({...p,data:get('media',p.mediaId,u.id).data}))});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(job,result,{status:'completed',completed:now()});if(!photos.some(p=>p.side==='back'))job.warnings=[...(job.warnings||[]),'No back panel was supplied. Photograph every instruction panel to avoid missing important details.'];save('packet_extraction',u.id,job)}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;job.status='failed';job.error=e.message||'Packet scan failed. Please retry.';save('packet_extraction',u.id,job)}finally{activePacketExtractions--}});
+     setImmediate(async()=>{try{if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;job.status='running';save('packet_extraction',u.id,job);const result=await packetExtractor({photos:photos.map(p=>({...p,data:get('media',p.mediaId,u.id).data}))});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(job,result,{status:'completed',completed:now()});if(!photos.some(p=>p.side==='back'))job.warnings=[...(job.warnings||[]),'No back panel was supplied. Photograph every instruction panel to avoid missing important details.'];save('packet_extraction',u.id,job)}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;job.status='failed';job.error=e.message||'Packet scan failed. Please retry.';save('packet_extraction',u.id,job)}finally{activePacketExtractions--}});
      return send(202,job);
     }
     if(method==='POST'&&id&&parts[4]==='confirm'&&parts.length===5){
@@ -198,7 +199,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
      if(list('assessment',u.id).some(a=>['queued','running'].includes(a.status)))fail(409,'A plant assessment is already running for your garden.');
      const a={id:randomUUID(),plantId:plant.id,status:'queued',purpose:body.purpose==='identify'?'identify':'diagnose',simulated:false,provider:'OpenAI',mediaId:body.mediaId,observations:symptoms,userObservations:symptoms,context:{watering:typeof body.watering==='string'?body.watering.slice(0,800):'Unknown',light:typeof body.light==='string'?body.light.slice(0,800):'Unknown'},created:now(),consentAt:now()};
      save('assessment',u.id,a);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,'assessment:'+key,JSON.stringify({id:a.id}));activeAnalyses++;
-     setImmediate(async()=>{try{a.status='running';save('assessment',u.id,a);const result=await analyzer({image:media.data,plant,symptoms,watering:a.context.watering,light:a.context.light});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(a,result,{status:result.imageQuality==='usable'?'completed':'inconclusive',completed:now()});save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:`Photo assessment: ${a.observations}`,assessmentId:a.id,mediaId:body.mediaId,created:now()});}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;a.status='failed';a.error=e.message||'Image analysis could not complete.';save('assessment',u.id,a);}finally{activeAnalyses--;}});
+     setImmediate(async()=>{try{if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;a.status='running';save('assessment',u.id,a);const result=await analyzer({image:media.data,plant,symptoms,watering:a.context.watering,light:a.context.light});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(a,result,{status:result.imageQuality==='usable'?'completed':'inconclusive',completed:now()});save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:`Photo assessment: ${a.observations}`,assessmentId:a.id,mediaId:body.mediaId,created:now()});}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;a.status='failed';a.error=e.message||'Image analysis could not complete.';save('assessment',u.id,a);}finally{activeAnalyses--;}});
      return send(202,{id:a.id,plantId:a.plantId,status:a.status,simulated:false,provider:'OpenAI'});
     }
    }
@@ -234,7 +235,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     if(kind==='listings'&&method==='DELETE'){const p=get('listing',target,u.id);p.active=false;save('listing',u.id,p);audit(u,'Listing removed',p.name+': '+str(body.reason||'Moderation review','Reason'));return send(200,p)}
    }
    fail(404,'Endpoint not found.');
-  }catch(e){send(e.status||500,{error:e.status?e.message:'Something went wrong. Please retry.',requestId:randomUUID()})}
+  }catch(e){send(e.status||500,{error:e.status?e.message:'Something went wrong. Please retry.',requestId})}
  });
  server.on('close',()=>{stopping=true;care.stop();if(backups)void backups.stop().finally(()=>db.close());else db.close()});return server;
 }
