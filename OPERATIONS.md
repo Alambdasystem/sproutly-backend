@@ -1,8 +1,16 @@
-# Sproutly persistent pilot storage — prepared, not activated
+# Sproutly persistent pilot storage — active
 
-Current live backend: free Render service `sproutly-backend` in Jim's workspace. Its filesystem is ephemeral. Do not deploy this storage change until the disk and data cutover are approved and ready.
+Activated on 2026-10-31 UTC for `sproutly-backend` in Jim's workspace after approval of the $7.25/month base and temporary demo reset. Paid compute and the 1 GB disk are attached; `/health` reports persistent storage and successful backup/restore verification. Existing OpenAI and CORS configuration was retained.
 
-## Proposed pilot layout
+## Live acceptance evidence
+
+Source commit `884521a556f7362b669abe33662eb62b718dddd1`; activation deploy `dep-dbinbkc9v7es7383ctig`, followed by replacement deploy `dep-dbinc4s9v7es7383e5f0` (live at 2026-10-31T05:02:18Z).
+
+A synthetic account, plant, private photo, photo-linked journal entry and reminder were created before replacement. Afterward, the existing session, password login, all records and exact photo bytes survived. Unauthenticated media access returned 401; another account could not retrieve the photo or plant (404). `/health` reported persistent storage with a successful native backup at 05:02:13Z and independent restore verification, with no backup failure. All 15 backend tests passed during deployment. OpenAI, GBIF and supplier-catalog integration settings remain active.
+
+Remaining: independent off-site backup export and physical-device acceptance below. Same-disk backups do not provide independent disaster recovery.
+
+## Active pilot layout
 
 - Existing service: paid `0.5c-512mb` compute, one instance.
 - Persistent disk: 1 GB mounted at `/var/data` (only mounted paths persist).
