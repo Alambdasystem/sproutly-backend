@@ -5,7 +5,7 @@ const plain=value=>String(value||'').replace(/<[^>]*>/g,'').replace(/&#(\d+);/g,
 export async function searchMarketplace(query,{page=1,fetchImpl=fetch}={}){
  const url=new URL(merchant.api);url.searchParams.set('search',query);url.searchParams.set('per_page','12');url.searchParams.set('page',String(page));
  const response=await fetchImpl(url,{signal:AbortSignal.timeout(12000),headers:{Accept:'application/json'}});
- if(!response.ok)throw new Error('The merchant catalog is unavailable. Please retry later.');
+ if(!response.ok)throw new Error(`Merchant catalog HTTP ${response.status}.`);
  const rows=await response.json();if(!Array.isArray(rows))throw new Error('The merchant returned an invalid catalog.');
  const retrievedAt=new Date().toISOString();
  const results=rows.map(p=>{

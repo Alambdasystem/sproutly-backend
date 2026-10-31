@@ -7,7 +7,7 @@ test('merchant prices preserve currency units, variant ranges, source URLs and r
  assert.equal(data.results.length,1);assert.equal(data.results[0].price,514);assert.equal(data.results[0].minorUnit,2);assert.equal(data.results[0].priceMax,1000);assert.equal(data.results[0].sample,false);assert.equal(data.results[0].inStock,false);assert.equal(data.hasMore,true);assert.equal(data.checkout,'merchant-website');
 });
 test('merchant failures never become sample listings or invented prices',async()=>{
- await assert.rejects(searchMarketplace('basil',{fetchImpl:async()=>new Response('{}',{status:503})}),/unavailable/);
+ await assert.rejects(searchMarketplace('basil',{fetchImpl:async()=>new Response('{}',{status:503})}),/HTTP 503/);
  await assert.rejects(searchMarketplace('basil',{fetchImpl:async()=>new Response('{}')}),/invalid catalog/);
  const data=await searchMarketplace('basil',{fetchImpl:async()=>new Response(JSON.stringify([{id:5,name:'Basil',permalink:'https://strictlymedicinalseeds.com/product/basil/',prices:{price:'invalid',currency_code:'USD',currency_minor_unit:2},images:[{src:'javascript:alert(1)'}]}]))});assert.equal(data.results[0].price,null);assert.equal(data.results[0].inStock,null);assert.equal(data.results[0].imageUrl,null);
 });

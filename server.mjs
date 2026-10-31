@@ -120,7 +120,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     const pageText=url.searchParams.get('page')||'1';if(!/^[1-5]$/.test(pageText))fail(400,'Page must be between 1 and 5.');const page=Number(pageText),cacheKey=q.toLowerCase()+':'+page;
     const cached=merchantCache.get(cacheKey);if(cached&&Date.now()-cached.at<900000)return send(200,{...cached.data,cached:true});
     if(!merchantPending.has(cacheKey)&&merchantPending.size>=3)fail(429,'The shop search is busy. Please retry shortly.');
-    try{if(!merchantPending.has(cacheKey))merchantPending.set(cacheKey,marketplaceSearch(q,{page}).then(data=>{if(merchantCache.size>=100)merchantCache.clear();merchantCache.set(cacheKey,{data,at:Date.now()});return data}).finally(()=>merchantPending.delete(cacheKey)));const data=await merchantPending.get(cacheKey);return send(200,{...data,cached:false})}catch{fail(502,'The merchant catalog is temporarily unavailable. No sample results were substituted. Please retry later.')}
+    try{if(!merchantPending.has(cacheKey))merchantPending.set(cacheKey,marketplaceSearch(q,{page}).then(data=>{if(merchantCache.size>=100)merchantCache.clear();merchantCache.set(cacheKey,{data,at:Date.now()});return data}).finally(()=>merchantPending.delete(cacheKey)));const data=await merchantPending.get(cacheKey);return send(200,{...data,cached:false})}catch(e){console.warn('merchant_lookup_failed',JSON.stringify({name:e.name,message:e.message,code:e.cause?.code}));fail(502,'The merchant catalog is temporarily unavailable. No sample results were substituted. Please retry later.')}
    }
    if(resource==='listings'){seedCatalog(u);
     if(method==='GET')return send(200,list('listing',u.id).filter(p=>p.active));
