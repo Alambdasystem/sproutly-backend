@@ -6,7 +6,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {createFoundation} from './foundation.mjs';
 function setup(path=':memory:'){
- const db=new DatabaseSync(path);db.exec("PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY);INSERT OR IGNORE INTO users VALUES('a'),('b');");
+ const db=new DatabaseSync(path);db.exec("PRAGMA foreign_keys=ON;CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY);INSERT OR IGNORE INTO users VALUES('a'),('b');CREATE TABLE IF NOT EXISTS requests(owner TEXT,key TEXT,response TEXT,PRIMARY KEY(owner,key));");
  const api=createFoundation(db,{ownedRecord:(kind,id,owner)=>{if(owner!=='a'||!['plant-a','photo-a'].includes(id)||((kind==='plant')!==(id==='plant-a')))throw Object.assign(new Error('Record not found.'),{status:404})}});
  return {db,api};
 }
@@ -49,3 +49,5 @@ test('validation, immutable links and optimistic locking prevent corrupt history
   assert.throws(()=>api.write('a','seed-packets',{name:'Basil',sources:[{type:'reference',label:'Unsafe',url:'javascript:alert(1)'}]}),{status:400});
  }finally{db.close()}
 });
+
+test('packet and project creation commits atomically and retries exactly once',()=>{const {db,api}=setup();try{const input={packet:{name:'Basil'},project:{name:'Kitchen basil',stage:'planned'}};const first=api.createProject('a',input,'draft-1');assert.deepEqual(api.createProject('a',input,'draft-1'),first);assert.equal(api.list('a','seed-packets').length,1);assert.equal(api.list('a','seed-projects').length,1);assert.throws(()=>api.createProject('a',{packet:{name:'Changed'},project:input.project},'draft-1'),{status:409});assert.throws(()=>api.createProject('a',{packet:{name:'Rollback'},project:{name:'Bad',stage:'invalid'}},'draft-2'),{status:400});assert.equal(api.list('a','seed-packets').length,1);assert.notEqual(api.createProject('b',input,'draft-1').project.id,first.project.id)}finally{db.close()}});

@@ -87,6 +87,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    if(path==='/api/v1/me'&&method==='GET')return send(200,userView(u));
    if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
+   if(path==='/api/v1/seed-projects/from-packet'&&method==='POST')return send(201,foundation.createProject(u.id,body,req.headers['idempotency-key']));
    if(parts[0]==='api'&&parts[1]==='v1'&&foundation.supports(resource)){
     if(parts.length>5)fail(404,'Endpoint not found.');
     const sub=parts[4];

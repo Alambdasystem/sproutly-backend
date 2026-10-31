@@ -6,6 +6,9 @@ test('authenticated foundation API roundtrip and ownership checks',async()=>{
  try{
   assert.equal((await call('/seed-projects')).status,401);
   const a=(await call('/auth/demo','POST',{})).data,b=(await call('/auth/demo','POST',{})).data;
+  const atomicBody={packet:{name:'Atomic packet'},project:{name:'Atomic project'}};
+  const atomicRequest=()=>fetch(base+'/seed-projects/from-packet',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${a.token}`,'Idempotency-Key':'http-draft'},body:JSON.stringify(atomicBody)}).then(async r=>({status:r.status,data:await r.json()}));
+  const atomic=await atomicRequest();assert.equal(atomic.status,201);assert.deepEqual((await atomicRequest()).data,atomic.data);
   const packet=await call('/seed-packets','POST',{name:'Basil'},a.token);assert.equal(packet.status,201);
   const project=await call('/seed-projects','POST',{name:'Windowsill basil',packetId:packet.data.id},a.token);assert.equal(project.status,201);
   assert.equal((await call('/seed-projects/'+project.data.id,'GET',null,b.token)).status,404);

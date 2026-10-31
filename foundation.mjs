@@ -38,8 +38,8 @@ export function createFoundation(db,{ownedRecord}={}){
   if(out.sowingDate&&(!/^\d{4}-\d{2}-\d{2}$/.test(out.sowingDate)||!Number.isFinite(Date.parse(out.sowingDate))||new Date(out.sowingDate).toISOString().slice(0,10)!==out.sowingDate))reject(400,'Invalid sowing date.');
   return out;
  }
- function write(owner,kind,input,id,expectedRevision){
-  db.exec('BEGIN IMMEDIATE');
+ function write(owner,kind,input,id,expectedRevision,withinTransaction=false){
+  if(!withinTransaction)db.exec('BEGIN IMMEDIATE');
   try{
    const previous=id?read(owner,kind,id):null;
    if(previous&&expectedRevision!==previous.revision)reject(409,'The record changed. Reload before saving.');
@@ -49,10 +49,22 @@ export function createFoundation(db,{ownedRecord}={}){
    const stamp=new Date().toISOString(),record={...fields,id:id||randomUUID(),schemaVersion:1,revision:(previous?.revision||0)+1,created:previous?.created||stamp,updated:stamp};
    db.prepare('INSERT INTO foundation_records VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body').run(record.id,owner,kind,record.revision,JSON.stringify(record));
    db.prepare('INSERT INTO foundation_versions VALUES(?,?,?)').run(record.id,record.revision,JSON.stringify(record));
-   db.exec('COMMIT');return record;
-  }catch(e){db.exec('ROLLBACK');throw e}
+   if(!withinTransaction)db.exec('COMMIT');return record;
+  }catch(e){if(!withinTransaction)db.exec('ROLLBACK');throw e}
  }
  return {
+  createProject(owner,input,key){
+   text(key,'request key',100);if(!input||typeof input!=='object'||!input.packet||!input.project)reject(400,'Packet and project details are required.');
+   const requestKey='seed-project:'+key;
+   db.exec('BEGIN IMMEDIATE');try{
+    const previous=db.prepare('SELECT response FROM requests WHERE owner=? AND key=?').get(owner,requestKey);
+    if(previous){const saved=JSON.parse(previous.response);if(saved.input!==JSON.stringify(input))reject(409,'This save key belongs to different details. Retry the original save or start a new draft.');db.exec('COMMIT');return saved.result}
+    const packet=write(owner,'seed-packets',input.packet,undefined,undefined,true);
+    const project=write(owner,'seed-projects',{...input.project,packetId:packet.id},undefined,undefined,true);
+    const result={packet,project};db.prepare('INSERT INTO requests VALUES(?,?,?)').run(owner,requestKey,JSON.stringify({input:JSON.stringify(input),result}));
+    db.exec('COMMIT');return result;
+   }catch(e){db.exec('ROLLBACK');throw e}
+  },
   supports:kind=>Object.hasOwn(types,kind),read,write,
   list:(owner,kind)=>db.prepare('SELECT body FROM foundation_records WHERE owner=? AND kind=? ORDER BY rowid DESC LIMIT 200').all(owner,kind).map(r=>JSON.parse(r.body)),
   versions(owner,kind,id){read(owner,kind,id);return db.prepare('SELECT body FROM foundation_versions WHERE record_id=? ORDER BY revision').all(id).map(r=>JSON.parse(r.body))},

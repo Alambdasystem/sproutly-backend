@@ -9,3 +9,5 @@ All links resolve in the authenticated user's records. Updates require optimisti
 This phase stores draft plan instructions only. OCR extraction, AI plan generation, rescue checkpoints, reminders, entitlements and frontend screens are subsequent phases. No new paid provider or credentials are required here.
 
 Validation: npm test includes database reopen persistence, cross-user read/write/link isolation, source/date validation, immutable links, stale revision rejection, message-role forgery prevention, authenticated HTTP roundtrips and existing API regression tests.
+
+Phase 2 save endpoint: POST /api/v1/seed-projects/from-packet accepts {packet, project} and an Idempotency-Key. Packet, project, version snapshots and replay response commit in one SQLite transaction. A retry with the same key and payload returns the same records; a changed payload returns 409. Photo uploads are authenticated separately before this transaction.
