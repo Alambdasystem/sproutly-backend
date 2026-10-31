@@ -39,13 +39,13 @@ export function createFoundation(db,{ownedRecord}={}){
   if(out.sowingDate&&(!/^\d{4}-\d{2}-\d{2}$/.test(out.sowingDate)||!Number.isFinite(Date.parse(out.sowingDate))||new Date(out.sowingDate).toISOString().slice(0,10)!==out.sowingDate))reject(400,'Invalid sowing date.');
   return out;
  }
- function write(owner,kind,input,id,expectedRevision,withinTransaction=false){
+ function write(owner,kind,input,id,expectedRevision,withinTransaction=false,allowPlantLink=false){
   if(!withinTransaction)db.exec('BEGIN IMMEDIATE');
   try{
    const previous=id?read(owner,kind,id):null;
    if(previous&&expectedRevision!==previous.revision)reject(409,'The record changed. Reload before saving.');
    // Links are immutable after creation; moving a conversation or plan would mix histories.
-   if(previous)for(const key of ['plantId','projectId','packetId','extractionId'])if(input[key]!==undefined&&input[key]!==previous[key])reject(400,'Record links cannot be changed.');
+   if(previous)for(const key of ['plantId','projectId','packetId','extractionId'])if(input[key]!==undefined&&input[key]!==previous[key]&&!(allowPlantLink&&kind==='seed-projects'&&key==='plantId'&&!previous.plantId))reject(400,'Record links cannot be changed.');
    const fields=validate(owner,kind,{...(previous?Object.fromEntries(types[kind].fields.filter(k=>previous[k]!==undefined).map(k=>[k,previous[k]])):{}),...input});
    const stamp=new Date().toISOString(),record={...fields,id:id||randomUUID(),schemaVersion:1,revision:(previous?.revision||0)+1,created:previous?.created||stamp,updated:stamp};
    db.prepare('INSERT INTO foundation_records VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,body=excluded.body').run(record.id,owner,kind,record.revision,JSON.stringify(record));

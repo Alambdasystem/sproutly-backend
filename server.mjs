@@ -1,5 +1,10 @@
 import http from 'node:http';
 import {createFoundation} from './foundation.mjs';
+import {createCare} from './care.mjs';
+import {createMembership} from './membership.mjs';
+import {createAccountControls} from './account-controls.mjs';
+import {weatherForecast} from './weather.mjs';
+import {transcribeVoice} from './transcription.mjs';
 import {extractPacket} from './packet-extraction.mjs';
 import {preparePacketImage} from './packet-images.mjs';
 import {validateConfirmedFields} from './packet-schema.mjs';
@@ -22,7 +27,7 @@ const str=(v,name,max=200)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fai
 const pick=(v,values,name)=>{if(!values.includes(v))fail(400,`Invalid ${name}.`);return v};
 const now=()=>new Date().toISOString();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,demo:!!u.demo});
-export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,packetExtractor=extractPacket,plantSearch=searchPlants,marketplaceSearch=searchMarketplace,backupEnabled=process.env.BACKUP_ENABLED==='true',backupDir=process.env.BACKUP_DIR||dirname(dbPath)+'/backups',accountOptions={},requiredMount=process.env.REQUIRE_PERSISTENT_STORAGE==='true'?(process.env.PERSISTENT_DATA_DIR||'/var/data'):null}={}){
+export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,packetExtractor=extractPacket,careAI,membershipOptions={},voiceTranscriber=transcribeVoice,weatherLookup=weatherForecast,plantSearch=searchPlants,marketplaceSearch=searchMarketplace,backupEnabled=process.env.BACKUP_ENABLED==='true',backupDir=process.env.BACKUP_DIR||dirname(dbPath)+'/backups',accountOptions={},requiredMount=process.env.REQUIRE_PERSISTENT_STORAGE==='true'?(process.env.PERSISTENT_DATA_DIR||'/var/data'):null}={}){
  const storage=requireMountedStorage({dbPath,mountPath:requiredMount,backupDir:backupEnabled?backupDir:null});
  if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true,mode:0o700});
  const db=new DatabaseSync(dbPath);if(dbPath!==':memory:')chmodSync(dbPath,0o600); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
@@ -40,6 +45,9 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  const get=(kind,id,owner)=>{const r=db.prepare('SELECT * FROM records WHERE kind=? AND id=? AND owner=?').get(kind,id,owner);if(!r)fail(404,'Record not found.');return JSON.parse(r.body)};
  const save=(kind,owner,data)=>{db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?,?)').run(data.id,kind,owner,JSON.stringify(data));return data};
  const foundation=createFoundation(db,{ownedRecord:get});
+ const membership=createMembership(db,membershipOptions);
+ const accountControls=createAccountControls(db,{forget:membership.forget});
+ const care=createCare({db,foundation,get,list,save,ai:careAI,access:membership.access,busy:()=>activeAnalyses>0||activePacketExtractions>0||activePhotoEdits>0||activeAudio>0});
  const audit=(u,action,target)=>save('audit',u.id,{id:randomUUID(),action,target,actor:u.name,at:now()});
  function seed(u){
   const date=now();
@@ -58,7 +66,8 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
   for(const item of catalog){const old=current.find(p=>p.sku===item.sku)||current.find(p=>!p.sku&&['Genovese basil','Cherry tomato seeds','Monstera cutting'].includes(p.name)&&p.species===item.species&&p.type===item.type);save('listing',u.id,{...item,id:old?.id||randomUUID(),providerId,provider:'Root & Rise Nursery (sample)',area:'St. Louis, MO',active:old?old.active:true,stock:old?old.stock:item.stock});}
   save('catalog_version',u.id,{id:'catalog-version-'+u.id,version:2});
  }
- let activeAnalyses=0,activePacketExtractions=0,activePhotoEdits=0;
+ let stopping=false;
+ let activeAnalyses=0,activePacketExtractions=0,activePhotoEdits=0,activeAudio=0;
  const referenceCache=new Map();
  const merchantCache=new Map();const merchantPending=new Map();
  function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:userView(u)}}
@@ -75,6 +84,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    const url=new URL(req.url,'http://localhost'),path=url.pathname,method=req.method;
    if(path==='/health')return send(200,{status:'ok',service:'sproutly-backend',mode:'demo-data',storage:storage.persistent?'persistent':'ephemeral',backups:{...(backups?.status||{enabled:false}),offsite:offsite.status}});
    let rawBody=Buffer.alloc(0);let body={};if(['POST','PATCH','DELETE'].includes(method)){let chunks=[],length=0;for await(const chunk of req){length+=chunk.length;if(length>5_500_000)fail(413,'Request too large.');chunks.push(chunk)}rawBody=Buffer.concat(chunks);try{body=JSON.parse(rawBody.toString()||'{}')}catch{fail(400,'Invalid JSON.')}}
+   if(path==='/api/v1/membership/webhook'&&method==='POST')return send(200,await membership.webhook(body,req.headers.authorization));
    if(path==='/api/v1/payments/webhook'&&method==='POST')return send(200,await payments.webhook(rawBody,req.headers['stripe-signature']));
    if(path.startsWith('/api/v1/auth/')&&method==='POST'){
     const ip=req.socket.remoteAddress;const r=rate.get(ip)||{count:0,until:Date.now()+60000};if(r.until<Date.now()){r.count=0;r.until=Date.now()+60000}if(++r.count>40)fail(429,'Please wait before trying again.');rate.set(ip,r);
@@ -88,11 +98,26 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    const requireRole=(...roles)=>{if(!roles.includes(u.role))fail(403,'Your account does not have permission for this action.')};
    if(path==='/api/v1/auth/verification'&&method==='POST')return send(200,await accounts.route(path,body,u));
    if(path==='/api/v1/auth/logout'&&method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(token);return send(200,{ok:true})}
+   if(path==='/api/v1/membership'&&method==='GET')return send(200,{...await membership.status(u.id),limits:{plants:3,identificationsPerWeek:3,questionsPerMonth:3,diagnosesPerMonth:1,complimentaryRescues:1}});
+   if(path==='/api/v1/membership/refresh'&&method==='POST')return send(200,await membership.status(u.id,true));
+   if(path==='/api/v1/account/export'&&method==='GET')return send(200,accountControls.export(u.id,url.searchParams.get('photos')==='true'));
+   if(path==='/api/v1/account'&&method==='DELETE')return send(200,accountControls.remove(u,body));
+   if(path==='/api/v1/voice/transcribe'&&method==='POST'){
+    await membership.access(u.id,'voice');if(activeAudio||activeAnalyses||activePacketExtractions||activePhotoEdits||care.isBusy())fail(429,'Audio/image processing is busy. Please retry shortly.');
+    const day=now().slice(0,10);if(list('voice_usage',u.id).filter(r=>r.created.startsWith(day)).length>=10)fail(429,'The daily voice limit has been reached. You can type instead.');activeAudio++;
+    try{const result=await voiceTranscriber(body);if(!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))fail(401,'This account was removed.');save('voice_usage',u.id,{id:randomUUID(),created:now(),model:result.model});return send(200,result)}finally{activeAudio--}
+   }
+   if(path==='/api/v1/weather/forecast'&&method==='POST'){
+    foundation.read(u.id,'seed-projects',body.projectId);const result=await weatherLookup(body,{evaluation:!!u.demo});if(!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))fail(401,'This account was removed.');return send(200,save('weather_context',u.id,{...result,id:randomUUID(),projectId:body.projectId}));
+   }
+   if(path==='/api/v1/support'&&method==='POST')return send(201,save('support',u.id,{id:randomUUID(),message:str(body.message,'Support message',4000),status:'saved',created:now(),notice:'Saved in your account. For a response, contact the support email shown in Help.'}));
+   if(path==='/api/v1/operations'&&method==='GET'){requireRole('admin');return send(200,{scope:'current-account',careJobs:list('care_job',u.id).map(j=>({id:j.id,type:j.type,status:j.status,created:j.created,usage:j.usage,model:j.model})),packetJobs:list('packet_extraction',u.id).map(j=>({id:j.id,status:j.status,created:j.created,usage:j.usage,model:j.model})),voiceRequests:list('voice_usage',u.id).length,localBackups:backups?.status||{enabled:false},offsite:offsite.status})}
    if(path==='/api/v1/me'&&method==='GET')return send(200,userView(u));
-   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
+   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:[...list('task',u.id),...list('seed_task',u.id).filter(t=>!t.cancelled)],journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
+   if(path.startsWith('/api/v1/care/')){const result=await care.route({owner:u.id,parts:parts.slice(3),method,body,key:req.headers['idempotency-key']});return send(result.status,result.data);}
    if(path==='/api/v1/packet-media/prepare'&&method==='POST'){
-    if(activePhotoEdits||activePacketExtractions||activeAnalyses)fail(429,'Photo processing is busy. Please retry shortly.');
+    if(activePhotoEdits||activePacketExtractions||activeAnalyses||activeAudio||care.isBusy())fail(429,'Photo processing is busy. Please retry shortly.');
     const media=get('media',str(body.mediaId,'Photo id',100),u.id);activePhotoEdits++;
     try{const result=await preparePacketImage(media.data,{rotation:body.rotation??0,crop:body.crop});const edited=save('media',u.id,{id:randomUUID(),data:result.data,originalMediaId:media.originalMediaId||media.id,created:now()});return send(201,{...result,id:edited.id,originalMediaId:edited.originalMediaId})}finally{activePhotoEdits--}
    }
@@ -104,12 +129,13 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
      const photos=body.photos.map(p=>{if(!p||!['front','back','instructions','barcode'].includes(p.side))fail(400,'Choose a packet photo side.');const media=get('media',str(p.mediaId,'Photo id',100),u.id);if(media.originalMediaId)get('media',media.originalMediaId,u.id);return{mediaId:media.id,originalMediaId:media.originalMediaId||media.id,side:p.side}});
      const key='packet-extraction:'+str(req.headers['idempotency-key'],'Scan request key',100),previous=db.prepare('SELECT response FROM requests WHERE owner=? AND key=?').get(u.id,key);
      if(previous){const job=get('packet_extraction',JSON.parse(previous.response).id,u.id);if(JSON.stringify(job.photos)!==JSON.stringify(photos))fail(409,'This scan key belongs to different photos. Start a new scan.');return send(200,job)}
+     await membership.access(u.id,'seed');
      if(packetExtractor===extractPacket&&!process.env.OPENAI_API_KEY)fail(503,'Seed packet extraction is not configured.');
-     if(activePacketExtractions||activeAnalyses||activePhotoEdits)fail(429,'Photo processing is busy. Please retry shortly.');
+     if(activePacketExtractions||activeAnalyses||activePhotoEdits||activeAudio||care.isBusy())fail(429,'Photo processing is busy. Please retry shortly.');
      const day=now().slice(0,10),daily=db.prepare("SELECT COUNT(*) AS n FROM records WHERE kind='packet_extraction' AND json_extract(body,'$.created')>=?").get(day).n;
      if(daily>=Number(process.env.PACKET_DAILY_LIMIT||50)||list('packet_extraction',u.id).filter(j=>j.created.startsWith(day)).length>=5)fail(429,'The daily packet scan limit has been reached. Use manual entry or try tomorrow.');
      const job={id:randomUUID(),photos,status:'queued',created:now(),consentAt:now(),provider:'OpenAI',schemaVersion:1};save('packet_extraction',u.id,job);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,key,JSON.stringify({id:job.id}));activePacketExtractions++;
-     setImmediate(async()=>{try{job.status='running';save('packet_extraction',u.id,job);const result=await packetExtractor({photos:photos.map(p=>({...p,data:get('media',p.mediaId,u.id).data}))});Object.assign(job,result,{status:'completed',completed:now()});if(!photos.some(p=>p.side==='back'))job.warnings=[...(job.warnings||[]),'No back panel was supplied. Photograph every instruction panel to avoid missing important details.'];save('packet_extraction',u.id,job)}catch(e){job.status='failed';job.error=e.message||'Packet scan failed. Please retry.';save('packet_extraction',u.id,job)}finally{activePacketExtractions--}});
+     setImmediate(async()=>{try{job.status='running';save('packet_extraction',u.id,job);const result=await packetExtractor({photos:photos.map(p=>({...p,data:get('media',p.mediaId,u.id).data}))});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(job,result,{status:'completed',completed:now()});if(!photos.some(p=>p.side==='back'))job.warnings=[...(job.warnings||[]),'No back panel was supplied. Photograph every instruction panel to avoid missing important details.'];save('packet_extraction',u.id,job)}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;job.status='failed';job.error=e.message||'Packet scan failed. Please retry.';save('packet_extraction',u.id,job)}finally{activePacketExtractions--}});
      return send(202,job);
     }
     if(method==='POST'&&id&&parts[4]==='confirm'&&parts.length===5){
@@ -121,7 +147,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     }
     fail(404,'Endpoint not found.');
    }
-   if(path==='/api/v1/seed-projects/from-packet'&&method==='POST')return send(201,foundation.createProject(u.id,body,req.headers['idempotency-key']));
+   if(path==='/api/v1/seed-projects/from-packet'&&method==='POST'){await membership.access(u.id,'seed');return send(201,foundation.createProject(u.id,body,req.headers['idempotency-key']));}
    if(parts[0]==='api'&&parts[1]==='v1'&&foundation.supports(resource)){
     if(parts.length>5)fail(404,'Endpoint not found.');
     const sub=parts[4];
@@ -132,13 +158,13 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     }
     if(sub)fail(404,'Endpoint not found.');
     if(method==='GET')return send(200,id?foundation.read(u.id,resource,id):foundation.list(u.id,resource));
-    if(method==='POST'&&!id)return send(201,foundation.write(u.id,resource,body));
+    if(method==='POST'&&!id){if(['seed-packets','seed-projects','grow-plans'].includes(resource))await membership.access(u.id,'seed');return send(201,foundation.write(u.id,resource,body));}
     if(method==='PATCH'&&id){const {revision,...changes}=body;return send(200,foundation.write(u.id,resource,changes,id,revision));}
     fail(405,'Method not allowed.');
    }
    if(resource==='plants'){
     if(method==='GET')return send(200,id?get('plant',id,u.id):list('plant',u.id));
-    if(method==='POST'){if(body.mediaId)get('media',body.mediaId,u.id);const p=save('plant',u.id,{id:randomUUID(),name:str(body.name,'Plant name',80),species:str(body.species||'Unknown','Species',120),stage:pick(body.stage||'Seed','Seed Germination Sprout Seedling Established Harvest Dormancy'.split(' '),'stage'),location:str(body.location||'Not specified','Location'),image:body.mediaId?'media':body.image||'sprout',mediaId:body.mediaId||null,status:'Not assessed',created:now()});if(p.mediaId)get('media',p.mediaId,u.id);save('journal',u.id,{id:randomUUID(),plantId:p.id,type:'Milestone',note:`Added ${p.name} to my garden.`,created:now()});return send(201,p)}
+    if(method==='POST'){await membership.access(u.id,'plant');if(body.mediaId)get('media',body.mediaId,u.id);const p=save('plant',u.id,{id:randomUUID(),name:str(body.name,'Plant name',80),species:str(body.species||'Unknown','Species',120),stage:pick(body.stage||'Seed','Seed Germination Sprout Seedling Established Harvest Dormancy'.split(' '),'stage'),location:str(body.location||'Not specified','Location'),image:body.mediaId?'media':body.image||'sprout',mediaId:body.mediaId||null,status:'Not assessed',created:now()});if(p.mediaId)get('media',p.mediaId,u.id);save('journal',u.id,{id:randomUUID(),plantId:p.id,type:'Milestone',note:`Added ${p.name} to my garden.`,created:now()});return send(201,p)}
     if(method==='PATCH'){const p=get('plant',id,u.id);for(const key of ['name','species','location'])if(body[key]!==undefined)p[key]=str(body[key],key);if(body.stage)p.stage=pick(body.stage,['Seed','Germination','Sprout','Seedling','Established','Harvest','Dormancy'],'stage');return send(200,save('plant',u.id,p))}
     if(method==='DELETE'){get('plant',id,u.id);if(db.prepare("SELECT 1 FROM foundation_records WHERE owner=? AND json_extract(body,'$.plantId')=? LIMIT 1").get(u.id,id))fail(409,'This plant has linked seed, conversation, or rescue history.');for(const kind of ['journal','task','assessment','story'])for(const r of list(kind,u.id))if(r.plantId===id)db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(r.id,u.id);db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(id,u.id);return send(200,{ok:true})}
    }
@@ -165,13 +191,14 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
      if(analyzer===analyzePlant&&!process.env.OPENAI_API_KEY)fail(503,'Image analysis is not configured. Please try again later.');
      const key=str(req.headers['idempotency-key'],'Assessment request key',100),previous=db.prepare('SELECT response FROM requests WHERE owner=? AND key=?').get(u.id,'assessment:'+key);
      if(previous)return send(200,get('assessment',JSON.parse(previous.response).id,u.id));
+     await membership.access(u.id,body.purpose==='identify'?'identify':'diagnose');
      const day=now().slice(0,10),daily=db.prepare("SELECT COUNT(*) AS n FROM records WHERE kind='assessment' AND json_extract(body,'$.created')>=?").get(day).n;
      if(daily>=Number(process.env.ANALYSIS_DAILY_LIMIT||100)||list('assessment',u.id).filter(a=>a.created.startsWith(day)).length>=10)fail(429,'The daily photo analysis limit has been reached. Please try again tomorrow.');
-     if(activeAnalyses>=2||activePacketExtractions||activePhotoEdits)fail(429,'The plant doctor is busy. Please retry shortly.');
+     if(activeAnalyses>=2||activePacketExtractions||activePhotoEdits||activeAudio||care.isBusy())fail(429,'The plant doctor is busy. Please retry shortly.');
      if(list('assessment',u.id).some(a=>['queued','running'].includes(a.status)))fail(409,'A plant assessment is already running for your garden.');
-     const a={id:randomUUID(),plantId:plant.id,status:'queued',simulated:false,provider:'OpenAI',mediaId:body.mediaId,observations:symptoms,userObservations:symptoms,context:{watering:typeof body.watering==='string'?body.watering.slice(0,800):'Unknown',light:typeof body.light==='string'?body.light.slice(0,800):'Unknown'},created:now(),consentAt:now()};
+     const a={id:randomUUID(),plantId:plant.id,status:'queued',purpose:body.purpose==='identify'?'identify':'diagnose',simulated:false,provider:'OpenAI',mediaId:body.mediaId,observations:symptoms,userObservations:symptoms,context:{watering:typeof body.watering==='string'?body.watering.slice(0,800):'Unknown',light:typeof body.light==='string'?body.light.slice(0,800):'Unknown'},created:now(),consentAt:now()};
      save('assessment',u.id,a);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,'assessment:'+key,JSON.stringify({id:a.id}));activeAnalyses++;
-     setImmediate(async()=>{try{a.status='running';save('assessment',u.id,a);const result=await analyzer({image:media.data,plant,symptoms,watering:a.context.watering,light:a.context.light});Object.assign(a,result,{status:result.imageQuality==='usable'?'completed':'inconclusive',completed:now()});save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:`Photo assessment: ${a.observations}`,assessmentId:a.id,mediaId:body.mediaId,created:now()});}catch(e){a.status='failed';a.error=e.message||'Image analysis could not complete.';save('assessment',u.id,a);}finally{activeAnalyses--;}});
+     setImmediate(async()=>{try{a.status='running';save('assessment',u.id,a);const result=await analyzer({image:media.data,plant,symptoms,watering:a.context.watering,light:a.context.light});if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;Object.assign(a,result,{status:result.imageQuality==='usable'?'completed':'inconclusive',completed:now()});save('assessment',u.id,a);save('journal',u.id,{id:randomUUID(),plantId:plant.id,type:'Assessment',note:`Photo assessment: ${a.observations}`,assessmentId:a.id,mediaId:body.mediaId,created:now()});}catch(e){if(stopping||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))return;a.status='failed';a.error=e.message||'Image analysis could not complete.';save('assessment',u.id,a);}finally{activeAnalyses--;}});
      return send(202,{id:a.id,plantId:a.plantId,status:a.status,simulated:false,provider:'OpenAI'});
     }
    }
@@ -209,7 +236,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    fail(404,'Endpoint not found.');
   }catch(e){send(e.status||500,{error:e.status?e.message:'Something went wrong. Please retry.',requestId:randomUUID()})}
  });
- server.on('close',()=>{if(backups)void backups.stop().finally(()=>db.close());else db.close()});return server;
+ server.on('close',()=>{stopping=true;care.stop();if(backups)void backups.stop().finally(()=>db.close());else db.close()});return server;
 }
 if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createApp();app.listen(Number(process.env.PORT)||3001,'0.0.0.0',()=>console.log('Sproutly API listening'));for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>app.close());}
 
