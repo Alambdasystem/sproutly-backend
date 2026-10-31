@@ -1,4 +1,5 @@
 import http from 'node:http';
+import {createFoundation} from './foundation.mjs';
 import {createAccounts} from './accounts.mjs';
 import {createOffsite} from './offsite.mjs';
 import {createPayments} from './payments.mjs';
@@ -35,6 +36,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  const list=(kind,owner)=>db.prepare('SELECT * FROM records WHERE kind=? AND owner=?').all(kind,owner).map(r=>JSON.parse(r.body));
  const get=(kind,id,owner)=>{const r=db.prepare('SELECT * FROM records WHERE kind=? AND id=? AND owner=?').get(kind,id,owner);if(!r)fail(404,'Record not found.');return JSON.parse(r.body)};
  const save=(kind,owner,data)=>{db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?,?)').run(data.id,kind,owner,JSON.stringify(data));return data};
+ const foundation=createFoundation(db,{ownedRecord:get});
  const audit=(u,action,target)=>save('audit',u.id,{id:randomUUID(),action,target,actor:u.name,at:now()});
  function seed(u){
   const date=now();
@@ -85,11 +87,25 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    if(path==='/api/v1/me'&&method==='GET')return send(200,userView(u));
    if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
+   if(parts[0]==='api'&&parts[1]==='v1'&&foundation.supports(resource)){
+    if(parts.length>5)fail(404,'Endpoint not found.');
+    const sub=parts[4];
+    if(sub==='versions'&&id&&method==='GET')return send(200,foundation.versions(u.id,resource,id));
+    if(sub==='messages'&&resource==='conversations'&&id){
+     if(method==='GET')return send(200,foundation.messages(u.id,id));
+     if(method==='POST')return send(201,foundation.append(u.id,id,body));
+    }
+    if(sub)fail(404,'Endpoint not found.');
+    if(method==='GET')return send(200,id?foundation.read(u.id,resource,id):foundation.list(u.id,resource));
+    if(method==='POST'&&!id)return send(201,foundation.write(u.id,resource,body));
+    if(method==='PATCH'&&id){const {revision,...changes}=body;return send(200,foundation.write(u.id,resource,changes,id,revision));}
+    fail(405,'Method not allowed.');
+   }
    if(resource==='plants'){
     if(method==='GET')return send(200,id?get('plant',id,u.id):list('plant',u.id));
     if(method==='POST'){if(body.mediaId)get('media',body.mediaId,u.id);const p=save('plant',u.id,{id:randomUUID(),name:str(body.name,'Plant name',80),species:str(body.species||'Unknown','Species',120),stage:pick(body.stage||'Seed','Seed Germination Sprout Seedling Established Harvest Dormancy'.split(' '),'stage'),location:str(body.location||'Not specified','Location'),image:body.mediaId?'media':body.image||'sprout',mediaId:body.mediaId||null,status:'Not assessed',created:now()});if(p.mediaId)get('media',p.mediaId,u.id);save('journal',u.id,{id:randomUUID(),plantId:p.id,type:'Milestone',note:`Added ${p.name} to my garden.`,created:now()});return send(201,p)}
     if(method==='PATCH'){const p=get('plant',id,u.id);for(const key of ['name','species','location'])if(body[key]!==undefined)p[key]=str(body[key],key);if(body.stage)p.stage=pick(body.stage,['Seed','Germination','Sprout','Seedling','Established','Harvest','Dormancy'],'stage');return send(200,save('plant',u.id,p))}
-    if(method==='DELETE'){get('plant',id,u.id);for(const kind of ['journal','task','assessment','story'])for(const r of list(kind,u.id))if(r.plantId===id)db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(r.id,u.id);db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(id,u.id);return send(200,{ok:true})}
+    if(method==='DELETE'){get('plant',id,u.id);if(db.prepare("SELECT 1 FROM foundation_records WHERE owner=? AND json_extract(body,'$.plantId')=? LIMIT 1").get(u.id,id))fail(409,'This plant has linked seed, conversation, or rescue history.');for(const kind of ['journal','task','assessment','story'])for(const r of list(kind,u.id))if(r.plantId===id)db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(r.id,u.id);db.prepare('DELETE FROM records WHERE id=? AND owner=?').run(id,u.id);return send(200,{ok:true})}
    }
    if(resource==='media'){
     if(method==='POST'){const data=str(body.data,'Image',5_400_000);if(!/^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/.test(data))fail(400,'Use a JPEG, PNG, or WebP image.');const p=save('media',u.id,{id:randomUUID(),data,created:now()});return send(201,{id:p.id})}
@@ -161,3 +177,4 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  server.on('close',()=>{if(backups)void backups.stop().finally(()=>db.close());else db.close()});return server;
 }
 if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createApp();app.listen(Number(process.env.PORT)||3001,'0.0.0.0',()=>console.log('Sproutly API listening'));for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>app.close());}
+
