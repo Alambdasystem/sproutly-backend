@@ -48,14 +48,14 @@ export async function restoreBackup(snapshot,destination){
  await mkdir(dirname(target),{recursive:true,mode:0o700});await copyFile(snapshot,target,constants.COPYFILE_EXCL);await chmod(target,0o600);
  try{const counts=inspectDatabase(target);if(JSON.stringify(counts)!==JSON.stringify(manifest.counts))throw new Error('Restored database differs from backup.');return{destination:target,counts,verifiedAt:new Date().toISOString()}}catch(e){await unlink(target).catch(()=>{});throw e}
 }
-export function startBackupSchedule(db,{directory,intervalHours=24,keep=7,onEvent=console.log}={}){
+export function startBackupSchedule(db,{directory,intervalHours=24,keep=7,onEvent=console.log,onVerified=null}={}){
  if(!Number.isInteger(keep)||keep<1||keep>30)throw new Error('Backup retention must be 1–30 snapshots.');
  if(!Number.isFinite(intervalHours)||intervalHours<1||intervalHours>168)throw new Error('Backup interval must be 1–168 hours.');
  const status={enabled:true,lastSuccessAt:null,restoreVerifiedAt:null,lastFailureAt:null};let pending=null,stopped=false;
  const run=()=>{
   if(stopped||pending)return pending;
   if(status.lastSuccessAt&&Date.now()-Date.parse(status.lastSuccessAt)<intervalHours*3600000)return Promise.resolve();
-  pending=createVerifiedBackup(db,directory,{keep}).then(result=>{status.lastSuccessAt=result.createdAt;status.restoreVerifiedAt=result.restoreVerifiedAt;status.lastFailureAt=null;onEvent('backup_verified',{createdAt:result.createdAt,counts:result.counts})}).catch(error=>{status.lastFailureAt=new Date().toISOString();console.error('backup_failed',error.message)}).finally(()=>{pending=null});return pending;
+  pending=createVerifiedBackup(db,directory,{keep}).then(async result=>{status.lastSuccessAt=result.createdAt;status.restoreVerifiedAt=result.restoreVerifiedAt;status.lastFailureAt=null;onEvent('backup_verified',{createdAt:result.createdAt,counts:result.counts});if(onVerified)try{await onVerified(result)}catch{console.error('offsite_backup_failed')}}).catch(error=>{status.lastFailureAt=new Date().toISOString();console.error('backup_failed',error.message)}).finally(()=>{pending=null});return pending;
  };
  const timer=setInterval(run,60000);timer.unref();void run();
  return{status,run,stop:()=>{stopped=true;clearInterval(timer);return pending||Promise.resolve()}};

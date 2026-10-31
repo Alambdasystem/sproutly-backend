@@ -8,7 +8,7 @@ import {createApp} from './server.mjs';
 import {createVerifiedBackup,restoreBackup,verifyBackup,startBackupSchedule} from './backup.mjs';
 import {requireMountedStorage} from './storage.mjs';
 const image='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1EAAAAASUVORK5CYII=';
-const start=async dbPath=>{const server=createApp({dbPath,backupEnabled:false,requiredMount:null});await new Promise(r=>server.listen(0,'127.0.0.1',r));return{server,base:`http://127.0.0.1:${server.address().port}/api/v1`}};
+const start=async dbPath=>{const server=createApp({dbPath,backupEnabled:false,requiredMount:null,accountOptions:{mailConfigured:()=>false}});await new Promise(r=>server.listen(0,'127.0.0.1',r));return{server,base:`http://127.0.0.1:${server.address().port}/api/v1`}};
 const close=server=>new Promise(r=>server.close(r));
 async function request(base,path,{token,body,method=body?'POST':'GET'}={}){const r=await fetch(base+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},body:body?JSON.stringify(body):undefined});return{status:r.status,data:await r.json()}}
 test('accounts, private photos, journal and sessions survive restart and a verified backup restore',async()=>{

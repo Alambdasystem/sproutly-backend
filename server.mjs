@@ -1,4 +1,7 @@
 import http from 'node:http';
+import {createAccounts} from './accounts.mjs';
+import {createOffsite} from './offsite.mjs';
+import {createPayments} from './payments.mjs';
 import {analyzePlant} from './vision.mjs';
 import {catalog,searchPlants} from './catalog.mjs';
 import {searchMarketplace} from './marketplace.mjs';
@@ -15,7 +18,7 @@ const str=(v,name,max=200)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fai
 const pick=(v,values,name)=>{if(!values.includes(v))fail(400,`Invalid ${name}.`);return v};
 const now=()=>new Date().toISOString();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,demo:!!u.demo});
-export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants,marketplaceSearch=searchMarketplace,backupEnabled=process.env.BACKUP_ENABLED==='true',backupDir=process.env.BACKUP_DIR||dirname(dbPath)+'/backups',requiredMount=process.env.REQUIRE_PERSISTENT_STORAGE==='true'?(process.env.PERSISTENT_DATA_DIR||'/var/data'):null}={}){
+export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants,marketplaceSearch=searchMarketplace,backupEnabled=process.env.BACKUP_ENABLED==='true',backupDir=process.env.BACKUP_DIR||dirname(dbPath)+'/backups',accountOptions={},requiredMount=process.env.REQUIRE_PERSISTENT_STORAGE==='true'?(process.env.PERSISTENT_DATA_DIR||'/var/data'):null}={}){
  const storage=requireMountedStorage({dbPath,mountPath:requiredMount,backupDir:backupEnabled?backupDir:null});
  if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true,mode:0o700});
  const db=new DatabaseSync(dbPath);if(dbPath!==':memory:')chmodSync(dbPath,0o600); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
@@ -24,7 +27,11 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,kind TEXT,owner TEXT,body TEXT);
  CREATE INDEX IF NOT EXISTS records_owner ON records(kind,owner);
  CREATE TABLE IF NOT EXISTS requests(owner TEXT,key TEXT,response TEXT,PRIMARY KEY(owner,key));`);
- const backups=backupEnabled&&dbPath!==':memory:'?startBackupSchedule(db,{directory:backupDir,intervalHours:Number(process.env.BACKUP_INTERVAL_HOURS||24),keep:Number(process.env.BACKUP_KEEP||7)}):null;
+ const payments=createPayments(db);
+ const accounts=createAccounts(db,accountOptions);
+ const userView=u=>({...publicUser(u),emailVerified:accounts.verified(u.id)});
+ const offsite=createOffsite();
+ const backups=backupEnabled&&dbPath!==':memory:'?startBackupSchedule(db,{onVerified:offsite.upload,directory:backupDir,intervalHours:Number(process.env.BACKUP_INTERVAL_HOURS||24),keep:Number(process.env.BACKUP_KEEP||7)}):null;
  const list=(kind,owner)=>db.prepare('SELECT * FROM records WHERE kind=? AND owner=?').all(kind,owner).map(r=>JSON.parse(r.body));
  const get=(kind,id,owner)=>{const r=db.prepare('SELECT * FROM records WHERE kind=? AND id=? AND owner=?').get(kind,id,owner);if(!r)fail(404,'Record not found.');return JSON.parse(r.body)};
  const save=(kind,owner,data)=>{db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?,?)').run(data.id,kind,owner,JSON.stringify(data));return data};
@@ -49,7 +56,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  let activeAnalyses=0;
  const referenceCache=new Map();
  const merchantCache=new Map();const merchantPending=new Map();
- function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:publicUser(u)}}
+ function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:userView(u)}}
  for(const record of db.prepare("SELECT * FROM records WHERE kind='assessment'").all()){const a=JSON.parse(record.body);if(['queued','running'].includes(a.status))save('assessment',record.owner,{...a,status:'failed',error:'The server restarted during analysis. Your photo is saved; please retry.'})}
  const rate=new Map();
  const server=http.createServer(async(req,res)=>{
@@ -60,20 +67,23 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
   if(req.method==='OPTIONS'){res.writeHead(204);return res.end()}
   try{
    const url=new URL(req.url,'http://localhost'),path=url.pathname,method=req.method;
-   if(path==='/health')return send(200,{status:'ok',service:'sproutly-backend',mode:'demo-data',storage:storage.persistent?'persistent':'ephemeral',backups:backups?.status||{enabled:false}});
-   let body={};if(['POST','PATCH','DELETE'].includes(method)){let chunks=[],length=0;for await(const chunk of req){length+=chunk.length;if(length>5_500_000)fail(413,'Request too large.');chunks.push(chunk)}try{body=JSON.parse(Buffer.concat(chunks).toString()||'{}')}catch{fail(400,'Invalid JSON.')}}
+   if(path==='/health')return send(200,{status:'ok',service:'sproutly-backend',mode:'demo-data',storage:storage.persistent?'persistent':'ephemeral',backups:{...(backups?.status||{enabled:false}),offsite:offsite.status}});
+   let rawBody=Buffer.alloc(0);let body={};if(['POST','PATCH','DELETE'].includes(method)){let chunks=[],length=0;for await(const chunk of req){length+=chunk.length;if(length>5_500_000)fail(413,'Request too large.');chunks.push(chunk)}rawBody=Buffer.concat(chunks);try{body=JSON.parse(rawBody.toString()||'{}')}catch{fail(400,'Invalid JSON.')}}
+   if(path==='/api/v1/payments/webhook'&&method==='POST')return send(200,await payments.webhook(rawBody,req.headers['stripe-signature']));
    if(path.startsWith('/api/v1/auth/')&&method==='POST'){
     const ip=req.socket.remoteAddress;const r=rate.get(ip)||{count:0,until:Date.now()+60000};if(r.until<Date.now()){r.count=0;r.until=Date.now()+60000}if(++r.count>40)fail(429,'Please wait before trying again.');rate.set(ip,r);
+    if(['/api/v1/auth/reset','/api/v1/auth/reset-confirm','/api/v1/auth/verify'].includes(path))return send(200,await accounts.route(path,body));
     if(path.endsWith('/demo')){if(process.env.DEMO_ENABLED==='false')fail(404,'Demo is disabled.');const u={id:randomUUID(),name:'Garden explorer',email:`demo-${randomUUID()}@example.invalid`,password:'',role:'admin',demo:1,created:now()};db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?,?)').run(u.id,u.name,u.email,u.password,u.role,1,u.created);seed(u);return send(201,session(u))}
-    if(path.endsWith('/register')){const email=str(body.email,'Email').toLowerCase();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))fail(400,'Enter a valid email.');const pw=str(body.password,'Password',200);if(pw.length<10)fail(400,'Use at least 10 characters for your password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail(409,'This email is already registered.');const salt=randomBytes(16).toString('hex');const u={id:randomUUID(),name:str(body.name,'Name',80),email,password:salt+':'+scryptSync(pw,salt,64).toString('hex'),role:'grower',demo:0,created:now()};db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?,?)').run(u.id,u.name,u.email,u.password,u.role,0,u.created);return send(201,{...session(u),emailDelivery:'not_configured'})}
+    if(path.endsWith('/register')){const email=str(body.email,'Email').toLowerCase();if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))fail(400,'Enter a valid email.');const pw=str(body.password,'Password',200);if(pw.length<10)fail(400,'Use at least 10 characters for your password.');if(db.prepare('SELECT id FROM users WHERE email=?').get(email))fail(409,'This email is already registered.');const salt=randomBytes(16).toString('hex');const u={id:randomUUID(),name:str(body.name,'Name',80),email,password:salt+':'+scryptSync(pw,salt,64).toString('hex'),role:'grower',demo:0,created:now()};db.prepare('INSERT INTO users VALUES(?,?,?,?,?,?,?)').run(u.id,u.name,u.email,u.password,u.role,0,u.created);const emailDelivery=await accounts.issue(u,'verify');return send(201,{...session(u),emailDelivery})}
     if(path.endsWith('/login')){const email=str(body.email,'Email').toLowerCase(),pw=str(body.password,'Password');const u=db.prepare('SELECT * FROM users WHERE email=?').get(email);if(!u?.password)fail(401,'Email or password is incorrect.');const[salt,hash]=u.password.split(':');if(!timingSafeEqual(Buffer.from(hash,'hex'),scryptSync(pw,salt,64)))fail(401,'Email or password is incorrect.');return send(200,session(u))}
-    if(path.endsWith('/reset'))return send(200,{message:'Password reset delivery is not connected in this demo. No email was sent.',simulated:true});
+
    }
    const token=(req.headers.authorization||'').replace(/^Bearer /,'');const s=db.prepare('SELECT * FROM sessions WHERE token=? AND expires>?').get(token,Date.now());if(!s)fail(401,'Please sign in.');const u=db.prepare('SELECT * FROM users WHERE id=?').get(s.user_id);
    const requireRole=(...roles)=>{if(!roles.includes(u.role))fail(403,'Your account does not have permission for this action.')};
+   if(path==='/api/v1/auth/verification'&&method==='POST')return send(200,await accounts.route(path,body,u));
    if(path==='/api/v1/auth/logout'&&method==='POST'){db.prepare('DELETE FROM sessions WHERE token=?').run(token);return send(200,{ok:true})}
-   if(path==='/api/v1/me'&&method==='GET')return send(200,publicUser(u));
-   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:publicUser(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:'simulated',email:'not-configured'}});}
+   if(path==='/api/v1/me'&&method==='GET')return send(200,userView(u));
+   if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:list('task',u.id),journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
    if(resource==='plants'){
     if(method==='GET')return send(200,id?get('plant',id,u.id):list('plant',u.id));
@@ -131,6 +141,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
     requireRole('provider','admin');
     if(method==='POST'||method==='PATCH'){const providers=list('provider',u.id).filter(p=>p.status==='approved');if(!providers.length)fail(403,'An approved provider is required.');const p=method==='PATCH'?get('listing',id,u.id):{id:randomUUID(),providerId:providers[0].id,provider:providers[0].name,area:providers[0].area,active:true};for(const k of ['name','species','description'])p[k]=str(body[k]??p[k],k,1000);p.type=pick(body.type??p.type,['Seeds','Seedlings'],'product type');for(const k of ['price','stock']){const v=body[k]??p[k];if(!Number.isInteger(v)||v<0||v>10000000)fail(400,`Invalid ${k}.`);p[k]=v}p.image=body.image||p.image||'sprout';audit(u,'Saved listing',p.name);return send(method==='POST'?201:200,save('listing',u.id,p))}
    }
+   if(path==='/api/v1/payments/checkout'&&method==='POST')return send(201,await payments.checkout(u,body.items,req.headers['idempotency-key']));
    if(resource==='checkout'&&method==='POST'){
     if(!Array.isArray(body.items)||!body.items.length||body.items.length>30)fail(400,'Add products to your cart.');const key=str(req.headers['idempotency-key'],'Checkout request key',100),prior=db.prepare('SELECT response FROM requests WHERE owner=? AND key=?').get(u.id,key);if(prior)return send(200,JSON.parse(prior.response));
     db.exec('BEGIN IMMEDIATE');try{let subtotal=0,provider;const seen=new Set();const items=body.items.map(i=>{if(seen.has(i.listingId))fail(400,'Duplicate cart item.');seen.add(i.listingId);const p=get('listing',i.listingId,u.id);if(!p.active)fail(409,'This product is unavailable.');if(!Number.isInteger(i.quantity)||i.quantity<1||i.quantity>99)fail(400,'Invalid quantity.');if(p.stock<i.quantity)fail(409,`${p.name} does not have enough stock.`);if(provider&&provider!==p.providerId)fail(400,'Use one provider per checkout.');provider=p.providerId;subtotal+=p.price*i.quantity;save('listing',u.id,{...p,stock:p.stock-i.quantity});return{listingId:p.id,name:p.name,quantity:i.quantity,price:p.price,image:p.image}});const order={id:randomUUID(),items,providerId:provider,subtotal,total:subtotal,fees:0,tax:0,status:'paid',paymentMode:'simulated',created:now(),pickup:'Demo pickup only — no real order was placed.'};save('order',u.id,order);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(u.id,key,JSON.stringify(order));audit(u,'Demo order placed',order.id);db.exec('COMMIT');return send(201,order)}catch(e){db.exec('ROLLBACK');throw e}
