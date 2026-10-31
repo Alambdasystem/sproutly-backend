@@ -9,6 +9,9 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node --watch server.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "backup": "node backup.mjs create",
+    "backup:verify": "node backup.mjs verify",
+    "backup:restore": "node backup.mjs restore"
   }
 }

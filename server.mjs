@@ -2,9 +2,11 @@ import http from 'node:http';
 import {analyzePlant} from './vision.mjs';
 import {catalog,searchPlants} from './catalog.mjs';
 import {searchMarketplace} from './marketplace.mjs';
+import {requireMountedStorage} from './storage.mjs';
+import {startBackupSchedule} from './backup.mjs';
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { mkdirSync,chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -13,14 +15,16 @@ const str=(v,name,max=200)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fai
 const pick=(v,values,name)=>{if(!values.includes(v))fail(400,`Invalid ${name}.`);return v};
 const now=()=>new Date().toISOString();
 const publicUser=u=>({id:u.id,name:u.name,email:u.email,role:u.role,demo:!!u.demo});
-export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants,marketplaceSearch=searchMarketplace}={}){
- if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true});
- const db=new DatabaseSync(dbPath); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
+export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqlite',origins=(process.env.CORS_ORIGINS||'http://localhost:8081,http://localhost:19006').split(','),analyzer=analyzePlant,plantSearch=searchPlants,marketplaceSearch=searchMarketplace,backupEnabled=process.env.BACKUP_ENABLED==='true',backupDir=process.env.BACKUP_DIR||dirname(dbPath)+'/backups',requiredMount=process.env.REQUIRE_PERSISTENT_STORAGE==='true'?(process.env.PERSISTENT_DATA_DIR||'/var/data'):null}={}){
+ const storage=requireMountedStorage({dbPath,mountPath:requiredMount,backupDir:backupEnabled?backupDir:null});
+ if(dbPath!==':memory:')mkdirSync(dirname(dbPath),{recursive:true,mode:0o700});
+ const db=new DatabaseSync(dbPath);if(dbPath!==':memory:')chmodSync(dbPath,0o600); db.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;');
  db.exec(`CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY,name TEXT,email TEXT UNIQUE,password TEXT,role TEXT,demo INTEGER,created TEXT);
  CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,user_id TEXT,expires INTEGER);
  CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY,kind TEXT,owner TEXT,body TEXT);
  CREATE INDEX IF NOT EXISTS records_owner ON records(kind,owner);
  CREATE TABLE IF NOT EXISTS requests(owner TEXT,key TEXT,response TEXT,PRIMARY KEY(owner,key));`);
+ const backups=backupEnabled&&dbPath!==':memory:'?startBackupSchedule(db,{directory:backupDir,intervalHours:Number(process.env.BACKUP_INTERVAL_HOURS||24),keep:Number(process.env.BACKUP_KEEP||7)}):null;
  const list=(kind,owner)=>db.prepare('SELECT * FROM records WHERE kind=? AND owner=?').all(kind,owner).map(r=>JSON.parse(r.body));
  const get=(kind,id,owner)=>{const r=db.prepare('SELECT * FROM records WHERE kind=? AND id=? AND owner=?').get(kind,id,owner);if(!r)fail(404,'Record not found.');return JSON.parse(r.body)};
  const save=(kind,owner,data)=>{db.prepare('INSERT OR REPLACE INTO records VALUES(?,?,?,?)').run(data.id,kind,owner,JSON.stringify(data));return data};
@@ -56,7 +60,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
   if(req.method==='OPTIONS'){res.writeHead(204);return res.end()}
   try{
    const url=new URL(req.url,'http://localhost'),path=url.pathname,method=req.method;
-   if(path==='/health')return send(200,{status:'ok',service:'sproutly-backend',mode:'demo-data'});
+   if(path==='/health')return send(200,{status:'ok',service:'sproutly-backend',mode:'demo-data',storage:storage.persistent?'persistent':'ephemeral',backups:backups?.status||{enabled:false}});
    let body={};if(['POST','PATCH','DELETE'].includes(method)){let chunks=[],length=0;for await(const chunk of req){length+=chunk.length;if(length>5_500_000)fail(413,'Request too large.');chunks.push(chunk)}try{body=JSON.parse(Buffer.concat(chunks).toString()||'{}')}catch{fail(400,'Invalid JSON.')}}
    if(path.startsWith('/api/v1/auth/')&&method==='POST'){
     const ip=req.socket.remoteAddress;const r=rate.get(ip)||{count:0,until:Date.now()+60000};if(r.until<Date.now()){r.count=0;r.until=Date.now()+60000}if(++r.count>40)fail(429,'Please wait before trying again.');rate.set(ip,r);
@@ -143,6 +147,6 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    fail(404,'Endpoint not found.');
   }catch(e){send(e.status||500,{error:e.status?e.message:'Something went wrong. Please retry.',requestId:randomUUID()})}
  });
- server.on('close',()=>db.close());return server;
+ server.on('close',()=>{if(backups)void backups.stop().finally(()=>db.close());else db.close()});return server;
 }
-if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createApp();app.listen(Number(process.env.PORT)||3001,'0.0.0.0',()=>console.log('Sproutly API listening'));}
+if(process.argv[1]===fileURLToPath(import.meta.url)){const app=createApp();app.listen(Number(process.env.PORT)||3001,'0.0.0.0',()=>console.log('Sproutly API listening'));for(const signal of ['SIGTERM','SIGINT'])process.once(signal,()=>app.close());}
