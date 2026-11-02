@@ -5,7 +5,7 @@ const fail=(status,message)=>{throw Object.assign(new Error(message),{status})};
 const str=(v,name,max=3000)=>{if(typeof v!=='string'||!v.trim()||v.length>max)fail(400,`Enter ${name} (up to ${max} characters).`);return v.trim()};
 const stamp=()=>new Date().toISOString();
 export function createCare({db,foundation,get,list,save,ai=runCareAI,access=async()=>{},busy=()=>false}){
- let active=0,closed=false;
+ let active=0,closed=false;const previews=new Map();
  const own=(kind,id,owner)=>get(kind,str(id,'record ID',150),owner);
  const rows=(kind,owner,key,value)=>list(kind,owner).filter(x=>x[key]===value);
  for(const r of db.prepare("SELECT * FROM records WHERE kind='care_job'").all()){const job=JSON.parse(r.body);if(['queued','running'].includes(job.status))save('care_job',r.owner,{...job,status:'failed',error:'The server restarted. Your saved inputs remain available; retry this request.'})}
@@ -23,14 +23,14 @@ export function createCare({db,foundation,get,list,save,ai=runCareAI,access=asyn
   if(active||busy())fail(429,'The care service is busy. Please retry shortly.');if(ai===runCareAI&&!process.env.OPENAI_API_KEY)fail(503,'AI care is not configured.');
   const today=stamp().slice(0,10),jobs=list('care_job',owner).filter(j=>j.created.startsWith(today));if(jobs.length>=15||db.prepare("SELECT COUNT(*) n FROM records WHERE kind='care_job' AND json_extract(body,'$.created')>=?").get(today).n>=Number(process.env.CARE_DAILY_LIMIT||100))fail(429,'The daily AI care limit has been reached. Saved plans and manual tracking remain available.');
   const job={id:randomUUID(),type,subject,fingerprint,status:'queued',created:stamp(),consentAt:stamp()};save('care_job',owner,job);db.prepare('INSERT INTO requests VALUES(?,?,?)').run(owner,requestKey,JSON.stringify({id:job.id}));active++;
-  setImmediate(async()=>{try{if(closed||!db.prepare('SELECT id FROM users WHERE id=?').get(owner))return;job.status='running';save('care_job',owner,job);const result=await ai(request);if(closed||!db.prepare('SELECT id FROM users WHERE id=?').get(owner))return;const applied=finish(result,job);Object.assign(job,{result:applied,status:'completed',completed:stamp(),usage:result.usage,model:result.model});save('care_job',owner,job)}catch(e){if(!closed&&db.prepare('SELECT id FROM users WHERE id=?').get(owner)){job.status='failed';job.error=e.message||'Care guidance failed. Please retry.';save('care_job',owner,job)}}finally{active--}});return job;
+  setImmediate(async()=>{try{if(closed||!db.prepare('SELECT id FROM users WHERE id=?').get(owner))return;job.status='running';save('care_job',owner,job);const result=await ai({...request,...(type==='doctor'?{onPreview:text=>{if(!closed&&typeof text==='string')previews.set(job.id,text.slice(0,6000))}}:{})});if(closed||!db.prepare('SELECT id FROM users WHERE id=?').get(owner))return;const applied=finish(result,job);Object.assign(job,{result:applied,status:'completed',completed:stamp(),usage:result.usage,model:result.model});save('care_job',owner,job)}catch(e){if(!closed&&db.prepare('SELECT id FROM users WHERE id=?').get(owner)){job.status='failed';job.error=e.message||'Care guidance failed. Please retry.';save('care_job',owner,job)}}finally{previews.delete(job.id);active--}});return job;
  }
  function requireConsent(body){if(body.consent!==true)fail(400,'Confirm sending this plant/project context and attached photos to OpenAI.');}
  const readProject=(owner,id)=>{const c=context(owner,{projectId:id});return{...c,latestPlan:c.plans.at(-1)||null,germinationWindow:germinationWindow(c.setup,c.packet,c.project.sowingDate||c.setup?.sowingDate),conversation:foundation.list(owner,'conversations').find(x=>x.projectId===id)||null}};
- return{isBusy:()=>active>0,stop(){closed=true},async route({owner,parts,method,body,key}){
+ return{isBusy:()=>active>0,stop(){closed=true;previews.clear()},async route({owner,parts,method,body,key}){
   const [resource,id,sub,index]=parts;
   if(resource==='overview'&&method==='GET')return{status:200,data:{tasks:list('seed_task',owner).filter(t=>!t.cancelled),rescues:list('rescue_plan',owner),events:list('seed_event',owner).slice(-60)}};
-  if(resource==='jobs'&&id&&method==='GET')return{status:200,data:own('care_job',id,owner)};
+  if(resource==='jobs'&&id&&method==='GET')return{status:200,data:{...own('care_job',id,owner),...(previews.has(id)?{preview:previews.get(id)}:{})}};
   if(resource==='projects'&&id){
    const c=context(owner,{projectId:id});
    if(method==='GET'&&!sub)return{status:200,data:readProject(owner,id)};

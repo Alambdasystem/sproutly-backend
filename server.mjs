@@ -73,7 +73,7 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
  function session(u){const token=randomBytes(32).toString('hex');db.prepare('INSERT INTO sessions VALUES(?,?,?)').run(token,u.id,Date.now()+7*864e5);return{token,user:userView(u)}}
  for(const record of db.prepare("SELECT * FROM records WHERE kind='assessment'").all()){const a=JSON.parse(record.body);if(['queued','running'].includes(a.status))save('assessment',record.owner,{...a,status:'failed',error:'The server restarted during analysis. Your photo is saved; please retry.'})}
  for(const record of db.prepare("SELECT * FROM records WHERE kind='packet_extraction'").all()){const job=JSON.parse(record.body);if(['queued','running'].includes(job.status))save('packet_extraction',record.owner,{...job,status:'failed',error:'The server restarted during this scan. Your photos are saved; retry the scan.'})}
- const rate=new Map();
+ const rate=new Map(),careStreams=new Map();
  const server=http.createServer(async(req,res)=>{
   const requestId=randomUUID(),started=performance.now();res.setHeader('X-Request-ID',requestId);res.once('finish',()=>{if(process.env.REQUEST_METRICS==='true')console.log(JSON.stringify({event:'api_request',requestId,method:req.method,status:res.statusCode,durationMs:Math.round(performance.now()-started)}))});
   const origin=req.headers.origin;
@@ -116,6 +116,22 @@ export function createApp({dbPath=process.env.DATABASE_PATH||'data/sproutly.sqli
    if(path==='/api/v1/me'&&method==='GET')return send(200,userView(u));
    if(path==='/api/v1/bootstrap'&&method==='GET'){seedCatalog(u);return send(200,{user:userView(u),plants:list('plant',u.id),tasks:[...list('task',u.id),...list('seed_task',u.id).filter(t=>!t.cancelled)],journal:list('journal',u.id),stories:list('story',u.id),assessments:list('assessment',u.id),listings:list('listing',u.id).filter(p=>p.active),orders:list('order',u.id),providers:list('provider',u.id),audit:u.role==='admin'?list('audit',u.id):[],mode:'seeded-demo',integrations:{assessments:process.env.OPENAI_API_KEY?'openai':'not-configured',plantReferences:'gbif',supplierInventory:'deep-harvest-public-catalog',sampleCatalog:true,payments:payments.status(),sampleCheckout:'simulated',email:accounts.configured()?'configured':'not-configured'}});}
    const parts=path.split('/').filter(Boolean),resource=parts[2],id=parts[3];
+   if(resource==='care'&&parts[3]==='jobs'&&parts[4]&&parts[5]==='events'&&parts.length===6&&method==='GET'){
+    const jobId=parts[4];await care.route({owner:u.id,parts:['jobs',jobId],method:'GET'});
+    if((careStreams.get(u.id)||0)>=2||[...careStreams.values()].reduce((a,b)=>a+b,0)>=8)fail(429,'Too many live care connections. Close another tab and retry.');
+    careStreams.set(u.id,(careStreams.get(u.id)||0)+1);let timer,last='',closed=false,lastBeat=Date.now();const deadline=Date.now()+110000;
+    const cleanup=()=>{if(closed)return;closed=true;clearInterval(timer);const n=(careStreams.get(u.id)||1)-1;if(n)careStreams.set(u.id,n);else careStreams.delete(u.id)};
+    res.once('close',cleanup);res.writeHead(200,{'Content-Type':'text/event-stream','Cache-Control':'no-store, no-transform','X-Accel-Buffering':'no'});res.flushHeaders();
+    const emit=(event,data)=>res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+    const push=async()=>{if(closed)return;try{
+     if(stopping||Date.now()>deadline)throw new Error('Live updates paused. Retrieve the saved result.');
+     if(!db.prepare('SELECT token FROM sessions WHERE token=? AND expires>?').get(token,Date.now())||!db.prepare('SELECT id FROM users WHERE id=?').get(u.id))throw new Error('Please sign in again.');
+     const {data:job}=await care.route({owner:u.id,parts:['jobs',jobId],method:'GET'});if(closed)return;
+     if(['completed','failed'].includes(job.status)){emit('job',job);cleanup();res.end();return}
+     const snapshot=JSON.stringify({id:job.id,status:job.status,preview:job.preview||''});if(snapshot!==last){last=snapshot;if(!emit('job',JSON.parse(snapshot))){cleanup();res.end()}}else if(Date.now()-lastBeat>10000){lastBeat=Date.now();if(!res.write(': heartbeat\n\n')){cleanup();res.end()}}
+    }catch(e){if(!closed){emit('paused',{message:e.message});cleanup();res.end()}}};
+    timer=setInterval(()=>{void push()},300);timer.unref();void push();return;
+   }
    if(path.startsWith('/api/v1/care/')){const result=await care.route({owner:u.id,parts:parts.slice(3),method,body,key:req.headers['idempotency-key']});return send(result.status,result.data);}
    if(path==='/api/v1/packet-media/prepare'&&method==='POST'){
     if(activePhotoEdits||activePacketExtractions||activeAnalyses||activeAudio||care.isBusy())fail(429,'Photo processing is busy. Please retry shortly.');
